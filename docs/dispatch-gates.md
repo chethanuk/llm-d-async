@@ -109,6 +109,12 @@ The available gate types, at a glance:
 ]
 ```
 
+> **Note:** A budget from a queue-level gate applies to that queue alone. Queues that target the same InferencePool each scale their own batch by the full budget. The budget is not split between them, so together they can dispatch more than one queue would.
+>
+> A pool-level gate is a single instance shared by every queue merged into that worker pool. It runs per message in the worker and returns a verdict, so it does not split a budget across queues either. An admission gate there, such as `local-max-concurrency`, does cap those queues together, on each replica. It does not reach queues on other worker pools.
+>
+> Dividing a budget across queues that target one InferencePool might require a custom gating strategy.
+
 ## Budget gates
 
 - `constant`: Always returns budget 1.0 (fully open). No parameters.
