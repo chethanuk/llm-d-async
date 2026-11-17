@@ -504,19 +504,21 @@ func TestSubmitRequest_ClearsStaleCancellationMarker(t *testing.T) {
 	assert.True(t, mr.Exists(api.RequestActiveTokenKey(requestID)))
 }
 
-// dropReplyConn fails the reply read of the first EVAL written on it with
-// io.EOF after the server has answered, as a connection reset after the
-// script ran would. go-redis then retries the EVAL. onDrop runs between the
-// two attempts.
+// dropReplyConn fails the reply read of the first write containing dropOn
+// (skipping EVALSHA, which Script.Run tries before EVAL) with io.EOF after the
+// server has answered, as a connection reset after the commands ran would.
+// go-redis then retries the write. onDrop runs between the two attempts.
 type dropReplyConn struct {
 	net.Conn
+	dropOn []byte
 	armed  *atomic.Bool
 	onDrop func()
 	drop   bool
 }
 
 func (c *dropReplyConn) Write(b []byte) (int, error) {
-	if bytes.Contains(bytes.ToLower(b), []byte("\r\neval\r\n")) && c.armed.CompareAndSwap(true, false) {
+	lower := bytes.ToLower(b)
+	if bytes.Contains(lower, c.dropOn) && !bytes.Contains(lower, []byte("evalsha")) && c.armed.CompareAndSwap(true, false) {
 		c.drop = true
 	}
 	return c.Conn.Write(b)
@@ -534,9 +536,12 @@ func (c *dropReplyConn) Read(b []byte) (int, error) {
 	return c.Conn.Read(b)
 }
 
+// enqueueGuardPrefix only appears in the enqueue script call.
+const enqueueGuardPrefix = "request-enqueued:"
+
 // submitWithLostReply submits r1 through a client that loses the reply to the
-// first enqueue script, and requires that the loss happened.
-func submitWithLostReply(t *testing.T, mr *miniredis.Miniredis, cluster bool, deadline int64, onDrop func(*RedisSortedSetProducer)) {
+// first write containing dropOn, and requires that the loss happened.
+func submitWithLostReply(t *testing.T, mr *miniredis.Miniredis, cluster bool, deadline int64, dropOn string, onDrop func(*RedisSortedSetProducer)) {
 	t.Helper()
 	var armed atomic.Bool
 	armed.Store(true)
@@ -546,7 +551,7 @@ func submitWithLostReply(t *testing.T, mr *miniredis.Miniredis, cluster bool, de
 		if err != nil {
 			return nil, err
 		}
-		return &dropReplyConn{Conn: conn, armed: &armed, onDrop: func() {
+		return &dropReplyConn{Conn: conn, dropOn: []byte(dropOn), armed: &armed, onDrop: func() {
 			if onDrop != nil {
 				onDrop(producer)
 			}
@@ -571,7 +576,7 @@ func submitWithLostReply(t *testing.T, mr *miniredis.Miniredis, cluster bool, de
 		Payload:  testPayload(map[string]any{"model": "test"}),
 	})
 	require.NoError(t, err)
-	require.False(t, armed.Load(), "the enqueue reply was dropped")
+	require.False(t, armed.Load(), "the reply was dropped")
 }
 
 func TestSubmitRequest_RetryAfterLostReplyEnqueuesOnce(t *testing.T) {
@@ -579,7 +584,7 @@ func TestSubmitRequest_RetryAfterLostReplyEnqueuesOnce(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			mr := miniredis.RunT(t)
 			deadline := time.Now().Add(time.Hour).Unix()
-			submitWithLostReply(t, mr, cluster, deadline, nil)
+			submitWithLostReply(t, mr, cluster, deadline, enqueueGuardPrefix, nil)
 
 			members, err := mr.ZMembers("requests")
 			require.NoError(t, err)
@@ -592,10 +597,20 @@ func TestSubmitRequest_RetryAfterLostReplyEnqueuesOnce(t *testing.T) {
 }
 
 func TestSubmitRequest_RetryAfterLostReplyKeepsACancel(t *testing.T) {
-	for name, cluster := range map[string]bool{"standalone": false, "cluster": true} {
-		t.Run(name, func(t *testing.T) {
+	tests := []struct {
+		name    string
+		cluster bool
+		dropOn  string
+	}{
+		{"standalone", false, enqueueGuardPrefix},
+		{"cluster", true, enqueueGuardPrefix},
+		// In cluster mode only the pre-enqueue pipeline writes the marker key.
+		{"cluster pipeline", true, "request-cancel:"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
 			mr := miniredis.RunT(t)
-			submitWithLostReply(t, mr, cluster, time.Now().Add(time.Hour).Unix(), func(p *RedisSortedSetProducer) {
+			submitWithLostReply(t, mr, tt.cluster, time.Now().Add(time.Hour).Unix(), tt.dropOn, func(p *RedisSortedSetProducer) {
 				assert.NoError(t, p.CancelRequests(context.Background(), []string{"r1"}))
 			})
 
@@ -614,7 +629,7 @@ func TestSubmitRequest_RetryAfterLostReplyEnqueuesOnceWhenTheServerClockPassedTh
 			mr := miniredis.RunT(t)
 			// Past the deadline, short of the sequence counter's grace.
 			mr.SetTime(time.Now().Add(time.Hour + enqueueSeqGrace/2))
-			submitWithLostReply(t, mr, cluster, time.Now().Add(time.Hour).Unix(), func(*RedisSortedSetProducer) {
+			submitWithLostReply(t, mr, cluster, time.Now().Add(time.Hour).Unix(), enqueueGuardPrefix, func(*RedisSortedSetProducer) {
 				mr.FastForward(time.Second) // the retry backoff
 			})
 
@@ -629,7 +644,7 @@ func TestSubmitRequest_EnqueueGuardTTLDoesNotFollowTheDeadline(t *testing.T) {
 	for name, cluster := range map[string]bool{"standalone": false, "cluster": true} {
 		t.Run(name, func(t *testing.T) {
 			mr := miniredis.RunT(t)
-			submitWithLostReply(t, mr, cluster, time.Now().Add(24*time.Hour).Unix(), nil)
+			submitWithLostReply(t, mr, cluster, time.Now().Add(24*time.Hour).Unix(), enqueueGuardPrefix, nil)
 
 			token, err := mr.Get(api.RequestActiveTokenKey("r1"))
 			require.NoError(t, err)
