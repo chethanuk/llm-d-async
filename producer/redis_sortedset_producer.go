@@ -76,6 +76,17 @@ redis.call("ZADD", KEYS[2], string.format("%.17g", score), ARGV[2] .. seq .. ARG
 return seq
 `)
 
+// clearStaleCancellationScript deletes the cancellation marker unless it holds
+// ARGV[1], this submit's token. A marker from an earlier generation is
+// cleared, but one set by a cancel that landed between two attempts of a
+// retried pipeline already names this token and survives the retry.
+var clearStaleCancellationScript = redis.NewScript(`
+if redis.call("GET", KEYS[1]) ~= ARGV[1] then
+  redis.call("DEL", KEYS[1])
+end
+return 0
+`)
+
 const (
 	enqueueSeqPlaceholder     = -1
 	enqueueSeqFieldJSON       = `"enqueue_seq":`
@@ -387,11 +398,12 @@ func (p *RedisSortedSetProducer) SubmitRequest(ctx context.Context, req api.Requ
 // enqueueCluster is SubmitRequest's write path when the keys cannot share a
 // slot. The markers and the payload are written first with single-key
 // commands, then the sequence stamp and ZADD run in one script on the queue's
-// slot. If the script fails, the marker and payload merely outlive a request
-// that never enqueued, and expire with the deadline.
+// slot. If the enqueue script fails, the marker and payload merely outlive a
+// request that never enqueued, and expire with the deadline.
 func (p *RedisSortedSetProducer) enqueueCluster(ctx context.Context, reqID, token, queue string, deadline int64, activeTTL time.Duration, seqExpireAt int64, jsonBefore, jsonAfter []byte, payloadRef string, payload []byte, payloadTTL time.Duration) error {
 	pipe := p.client.Pipeline()
-	pipe.Del(ctx, api.RequestCancellationKey(reqID))
+	// Eval, not Run: a pipeline cannot fall back from EVALSHA on NOSCRIPT.
+	clearStaleCancellationScript.Eval(ctx, pipe, []string{api.RequestCancellationKey(reqID)}, token)
 	pipe.Set(ctx, api.RequestActiveTokenKey(reqID), token, activeTTL)
 	if payloadRef != "" {
 		pipe.Set(ctx, payloadRef, payload, payloadTTL)
