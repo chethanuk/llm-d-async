@@ -3722,7 +3722,7 @@ func TestPayloadModel(t *testing.T) {
 	}{
 		{"model present", `{"model":"payload"}`, "payload"},
 		{"no model key", `{"prompt":"hello"}`, ""},
-		{"unparseable", `{not json`, ""},
+		{"unparsable", `{not json`, ""},
 		{"empty", ``, ""},
 	} {
 		if got := payloadModel(json.RawMessage(tc.payload)); got != tc.want {
